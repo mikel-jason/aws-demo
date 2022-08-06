@@ -1,0 +1,264 @@
+Parameters: # -----------------------------------------------------------------
+  Ec2KeyPair:
+    Type: String
+    Description: SSH key pair used to access the provisioned EC2 instance
+  Ec2Ami:
+    Type: String
+    Description: The AMI used to create the EC2 instance
+
+Resources: # ------------------------------------------------------------------
+  
+  # ---------------------------------------------------------------------------
+  # S3 ------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: DocCreatedTopic
+    Properties:
+      BucketName: !Join [ '', ['cloudformation-', !Ref AWS::StackName, '-bucket']]
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref DocCreatedTopic
+            Event: 's3:ObjectCreated:*'
+
+  # ---------------------------------------------------------------------------
+  # SNS, SQS ------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+
+  DocCreatedTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Join [ '', ['cloudformation-', !Ref AWS::StackName, '-topic']]
+  DocCreatedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout:  45
+  DocCreatedQueueFanOut:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DocCreatedTopic
+      Endpoint: !GetAtt DocCreatedQueue.Arn
+      Protocol: sqs
+  DocCreatedQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DocCreatedQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - SQS:SendMessage
+            Principal:
+              Service:
+                - 'sns.amazonaws.com'
+            Resource: !GetAtt DocCreatedQueue.Arn
+  DocCreatedTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref DocCreatedTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - sns:Publish
+            Resource: !Ref DocCreatedTopic
+            Principal:
+              Service:
+                - 's3.amazonaws.com'
+
+  # ---------------------------------------------------------------------------
+  # Dynamo DB -----------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+
+  FileIndexTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions: # care: DDB is scheme-less, only attributes for keys here!
+        - AttributeName: 'objectkey'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'objectkey'
+          KeyType: 'HASH'
+      TimeToLiveSpecification:
+        AttributeName: 'expires'
+        Enabled: true
+      BillingMode: PAY_PER_REQUEST
+      TableName: !Join [ '', ['cloudformation-', !Ref AWS::StackName, '-file-index']]
+
+  # ---------------------------------------------------------------------------
+  # Lambda --------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+
+  FileIndexerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt FileIndexerExecRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+
+          import boto3
+
+          print('Loading function')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['ddb_index_table'])
+          print('Loaded function')
+
+          def lambda_handler(event, context):
+            for record in event['Records']:
+              body = json.loads(record['body'])
+              msg = json.loads(body['Message'])
+              for r in msg['Records']:
+    
+                bucketName = r['s3']['bucket']['name']
+                bucketArn = r['s3']['bucket']['arn']
+                objectKey = r['s3']['object']['key']
+
+                print('Gonna index {} in {} ({})'.format(objectKey, bucketName, bucketArn))
+                table.put_item(Item = {
+                  'objectkey': objectKey,
+                  'expires': int(time.time()) + 60 * 80 * 24
+                })
+            return 'Successfully processed {} records.'.format(len(event['Records']))
+      Environment:
+        Variables:
+          ddb_index_table: !Ref FileIndexTable
+      ReservedConcurrentExecutions: 10
+      Timeout: 5
+  FileIndexerExecRole:
+    Type: AWS::IAM::Role
+    DependsOn: FileIndexTable
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      Description: Execution role for Lambda Func indexing created files
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'dynamo_access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                Resource: 
+                  - !Sub
+                    - 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}'
+                    - TableName: !Ref FileIndexTable
+        - PolicyName: 'sqs_access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt DocCreatedQueue.Arn
+  FileIndexerTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: FileIndexerExecRole
+    Properties:
+      EventSourceArn: !GetAtt DocCreatedQueue.Arn
+      FunctionName: !Ref FileIndexerLambda
+
+  # ---------------------------------------------------------------------------
+  # EC2 -----------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+
+  ListEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref Ec2Ami
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref ListEc2InstanceProfile
+      KeyName: !Ref Ec2KeyPair
+      SecurityGroups:
+        - !Ref ListEc2InstanceSecurityGroup
+      UserData: 
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            echo "${TableName}" > /home/ec2-user/vars
+            echo "${BucketName}" >> /home/ec2-user/vars
+          - TableName: !Ref FileIndexTable
+            BucketName: !Ref DocumentBucket
+  ListEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ListEc2InstanceExecutionRole
+  ListEc2InstanceExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: s3_access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: !Ref DocumentBucket
+        - PolicyName: dynamo_access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}'
+                    - TableName: !Ref FileIndexTable
+            
+  ListEc2InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "CloudFormation App Stack HTTP & SSH"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22 # best practice to not combine SSH SG w/ any other, but sufficient for demo
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+Outputs: # --------------------------------------------------------------------
+  Ec2InstanceUrl:
+    Description: URL of created EC2 instance for object listing
+    Value: !GetAtt ListEc2Instance.PublicDnsName

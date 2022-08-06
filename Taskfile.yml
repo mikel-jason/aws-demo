@@ -1,0 +1,45 @@
+version: '3'
+
+dotenv:
+  - .env
+
+vars:
+  EVAL_STACKNAME: # can override .env
+    sh: echo ${STACK:-{{ .STACKNAME }}}
+
+tasks:
+  create:
+    cmds:
+      - |
+        aws cloudformation create-stack \
+        --stack-name {{ .EVAL_STACKNAME }} \
+        --template-body file://./cloudformation-stack.yaml \
+        --capabilities CAPABILITY_IAM \
+        --parameters '[
+          {"ParameterKey":"Ec2KeyPair", "ParameterValue":"{{ .KEY_PAIR }}"},
+          {"ParameterKey":"Ec2Ami", "ParameterValue":"{{ .AMI }}"}
+          ]'
+  update:
+    cmds:
+      - |
+        aws cloudformation update-stack \
+        --stack-name {{ .EVAL_STACKNAME }} \
+        --template-body file://./cloudformation-stack.yaml \
+        --capabilities CAPABILITY_IAM \
+        --parameters '[
+          {"ParameterKey":"Ec2KeyPair", "ParameterValue":"{{ .KEY_PAIR }}"},
+          {"ParameterKey":"Ec2Ami", "ParameterValue":"{{ .AMI }}"}
+          ]'
+  delete: aws cloudformation delete-stack --stack-name {{ .EVAL_STACKNAME }}
+  deploy:
+    cmds:
+      - cd go && GOOS=linux GOARCH=amd64 go build main.go
+      - ssh ec2-user@{{ .EC2_INSTANCE_URL }} 'sudo systemctl stop app.service || true'
+      - scp go/{main,site.tmpl,app.service} ec2-user@{{ .EC2_INSTANCE_URL }}:/home/ec2-user/
+      - ssh ec2-user@{{ .EC2_INSTANCE_URL }} 'sudo mv app.service /etc/systemd/system/'
+      - ssh ec2-user@{{ .EC2_INSTANCE_URL }} 'sudo systemctl daemon-reload'
+      - ssh ec2-user@{{ .EC2_INSTANCE_URL }} 'sudo systemctl start app.service'
+      - echo "Visite page @ http://{{ .EC2_INSTANCE_URL }}"
+    vars:
+      EC2_INSTANCE_URL:
+        sh: aws cloudformation describe-stacks --stack-name {{ .EVAL_STACKNAME }} --query 'Stacks[0].Outputs[?OutputKey==`Ec2InstanceUrl`].OutputValue' --output text

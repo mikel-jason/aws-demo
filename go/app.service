@@ -1,0 +1,9 @@
+[Unit]
+Description=AWS Experiment Demo Application
+
+[Service]
+WorkingDirectory=/home/ec2-user
+ExecStart=/home/ec2-user/main --addr=:80
+
+[Install]
+WantedBy=default.target

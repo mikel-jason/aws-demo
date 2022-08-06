@@ -1,0 +1,23 @@
+{{ define "main" }}
+<html>
+<head>
+<meta key="robot" value="noindex" />
+</head>
+<body>
+    <table>
+        <thead>
+            <tr>
+                <th>Object</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{ range . }}
+            <tr>
+                <td><a href="{{ .Href }}" target="_blank">{{ .ObjectKey }} (expires: {{ .Expires }})</a></td>
+            </tr>
+            {{ end }}
+        </tbody>
+    </table>
+</body>
+</html>
+{{ end }}
